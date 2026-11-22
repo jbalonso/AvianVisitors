@@ -84,10 +84,23 @@ function recentWindow(
     int $hours,
     array $dateContext,
     bool $resetAtMidnight,
-    bool $scoped
+    bool $scoped,
+    ?string $since = null
 ): array {
     $through = "DATETIME(Date||' '||Time) <= DATETIME(:anchor)";
     $enabled = $resetAtMidnight && !$scoped;
+    // An explicit `since` (the frame composer's civil-dawn window) pins the lower
+    // bound directly and overrides the rolling-hours / midnight-reset logic: the
+    // window is [since, anchor]. `since` is a validated local 'Y-m-d H:i:s' string.
+    if ($since !== null) {
+        return [
+            'where' => $through." AND DATETIME(Date||' '||Time) >= DATETIME(:window_start)",
+            'bind' => [':anchor' => $dateContext['anchor'], ':window_start' => $since],
+            'reset_at_midnight' => false,
+            'midnight_clamped' => false,
+            'window_start' => $since,
+        ];
+    }
     if ($hours >= 1000000) {
         return [
             'where' => $through,
@@ -272,6 +285,16 @@ function validIsoDate(string $date): bool {
     return $parsed !== false && $parsed->format('Y-m-d') === $date;
 }
 
+// Validate+normalize a composer-supplied `since` lower bound: a local
+// 'Y-m-d H:i:s' timestamp (the station's clock, same as Date||' '||Time).
+// Returns the canonical string, or null when it does not parse exactly (which
+// the caller turns into a 400 rather than silently widening the window).
+function normalizeSince(string $value): ?string {
+    $value = trim($value);
+    $parsed = DateTimeImmutable::createFromFormat('!Y-m-d H:i:s', $value);
+    return ($parsed !== false && $parsed->format('Y-m-d H:i:s') === $value) ? $value : null;
+}
+
 // A stats date is always interpreted in the station's SQLite local clock.
 // Today ends at the current second; a historical date ends at 23:59:59.
 // Returning the same shape from every date-aware action keeps the frontend's
@@ -354,13 +377,26 @@ switch ($action) {
         // "ALL" button can turn off the time filter without needing a
         // separate code path.
         $hours = max(1, min(1000000, (int)($_GET['hours'] ?? 24)));
+        // Optional precise lower bound (the frame composer's civil-dawn window).
+        // When present it overrides the rolling `hours` window; invalid input is a
+        // 400 rather than a silent fall-through to the default window.
+        $since = null;
+        if (isset($_GET['since'])) {
+            $since = normalizeSince((string)$_GET['since']);
+            if ($since === null) {
+                http_response_code(400);
+                birdnetRespond($db, $educatorScope, ['error' => 'bad since']);
+                break;
+            }
+        }
         $ctx = dateContext($db, $educatorScope);
         $window = recentWindow(
             $db,
             $hours,
             $ctx,
             $RESET_AT_MIDNIGHT,
-            $educatorScope !== null
+            $educatorScope !== null,
+            $since
         );
         $where = $window['where'];
         $bind = $window['bind'];
